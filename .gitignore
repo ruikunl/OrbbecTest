@@ -1,0 +1,22 @@
+.DS_Store
+__pycache__/
+*.py[cod]
+
+# Generated locally by OrbbecSDK and the viewer.
+/Log/
+/bin/
+/build/
+/outputs/*
+!/outputs/.gitkeep
+
+# Local dependency caches and failed/experimental Python SDK artifacts.
+/.venv/
+/runtimes/
+/wheel_extract/
+/downloads/*
+!/downloads/.gitkeep
+
+# OrbbecSDK is a third-party binary SDK. Download and extract it locally;
+# do not vendor the SDK package into this repository.
+/sdk_v1_10_16/*
+!/sdk_v1_10_16/.gitkeep
