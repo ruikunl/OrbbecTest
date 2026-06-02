@@ -22,6 +22,8 @@ Connection: USB2.0
 - Depth / 参数 / 点云：OrbbecSDK C/C++ v1.10.16
 - RGB 视频：macOS AVFoundation
 
+已单独测试过 OrbbecSDK 的 `COLOR` 直读路径；在当前 macOS + SL1000S_U3 上会卡在 SDK 的 UVC 打开阶段并报 `uvc_open ... failed, return res-3`。因此 viewer 会跳过 SDK 的 COLOR profile 枚举，避免触发这条不稳定路径。
+
 `pyorbbecsdk2` 已验证不能稳定识别这个旧 OpenNI 设备，因此不是本项目依赖。
 
 ## 依赖
@@ -113,6 +115,7 @@ open build/OrbbecViewer.app
 ```
 
 首次打开 RGB 时，macOS 会请求摄像头权限。允许后 viewer 会优先选择名称里包含 `USB` / `Orbbec` / `Camera` 的 UVC 摄像头。
+工具栏里的 `Depth Res` 和 `RGB Res` 可以从当前设备实际枚举到的模式里选择分辨率；如果对应视频流已经在运行，先停流再开流后生效。
 
 ## 保存文件
 
@@ -134,11 +137,13 @@ outputs/viewer_captures/
 src/
   OrbbecViewer.mm                 macOS AppKit + AVFoundation + OrbbecSDK viewer
   read_orbbec_intrinsics_v1.cpp   OrbbecSDK v1 参数读取工具
+  test_sdk_rgb.cpp                诊断用：SDK COLOR 直读测试
 
 scripts/
   build_intrinsics_probe.sh       编译参数读取工具
   read_intrinsics_metadata.sh     读取参数并生成 JSON 摘要
   make_intrinsics_summary_json.py 文本报告转 compact JSON
+  test_sdk_rgb.sh                 诊断用：验证 SDK COLOR 直读是否可用
 
 viewer/
   build_viewer.sh                 构建 .app

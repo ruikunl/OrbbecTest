@@ -32,6 +32,14 @@ struct CloudPoint {
     uint8_t b;
 };
 
+struct DepthProfileOption {
+    int      width  = 0;
+    int      height = 0;
+    int      fps    = 0;
+    OBFormat format = OB_FORMAT_UNKNOWN;
+    std::string label;
+};
+
 static NSString *NSStringFromStd(const std::string &value) {
     return [NSString stringWithUTF8String:value.c_str()] ?: @"";
 }
@@ -248,6 +256,48 @@ static std::vector<uint8_t> DepthToBGRA(const uint16_t *depth, int width, int he
     return bgra;
 }
 
+static std::string DepthProfileLabel(const DepthProfileOption &profile) {
+    std::ostringstream out;
+    out << profile.width << "x" << profile.height << " @" << profile.fps << " fmt=" << static_cast<int>(profile.format);
+    return out.str();
+}
+
+static bool SameDepthProfile(const DepthProfileOption &a, const DepthProfileOption &b) {
+    return a.width == b.width && a.height == b.height && a.fps == b.fps && a.format == b.format;
+}
+
+static NSString *ResolutionLabel(int width, int height) {
+    return [NSString stringWithFormat:@"%dx%d", width, height];
+}
+
+static BOOL ParseResolutionLabel(NSString *label, int *width, int *height) {
+    if(!label || [label isEqualToString:@"Auto"]) {
+        if(width) {
+            *width = 0;
+        }
+        if(height) {
+            *height = 0;
+        }
+        return NO;
+    }
+    NSArray<NSString *> *parts = [label componentsSeparatedByString:@"x"];
+    if(parts.count != 2) {
+        return NO;
+    }
+    int w = parts[0].intValue;
+    int h = parts[1].intValue;
+    if(w <= 0 || h <= 0) {
+        return NO;
+    }
+    if(width) {
+        *width = w;
+    }
+    if(height) {
+        *height = h;
+    }
+    return YES;
+}
+
 static bool WriteDepthPGM(const std::vector<uint16_t> &depth, int width, int height, NSString *path) {
     if(depth.empty() || width <= 0 || height <= 0) {
         return false;
@@ -288,7 +338,7 @@ public:
     }
 
     ~OrbbecDepthEngine() {
-        setEnabled(false, false);
+        shutdown();
     }
 
     bool refreshDeviceInfo() {
@@ -323,6 +373,7 @@ public:
             info << "UID: " << devInfo->uid() << "\n";
             info << "Connection: " << devInfo->connectionType() << "\n";
 
+            depthProfiles_.clear();
             calibrationParams_.clear();
             try {
                 auto paramList = device_->getCalibrationCameraParamList();
@@ -343,6 +394,10 @@ public:
                 for(uint32_t s = 0; s < sensors->count(); ++s) {
                     auto sensor = sensors->getSensor(s);
                     info << "  " << s << ": " << SensorName(sensor->type()) << "\n";
+                    if(sensor->type() == OB_SENSOR_COLOR) {
+                        info << "    profiles skipped: RGB is handled by macOS AVFoundation/UVC in this viewer.\n";
+                        continue;
+                    }
                     try {
                         auto profiles = sensor->getStreamProfileList();
                         for(uint32_t p = 0; p < profiles->count(); ++p) {
@@ -351,6 +406,24 @@ public:
                             if(profile->is<ob::VideoStreamProfile>()) {
                                 auto video = profile->as<ob::VideoStreamProfile>();
                                 info << " " << video->width() << "x" << video->height() << "@" << video->fps();
+                                if(sensor->type() == OB_SENSOR_DEPTH && profile->type() == OB_STREAM_DEPTH) {
+                                    DepthProfileOption option{};
+                                    option.width  = static_cast<int>(video->width());
+                                    option.height = static_cast<int>(video->height());
+                                    option.fps    = static_cast<int>(video->fps());
+                                    option.format = profile->format();
+                                    option.label  = DepthProfileLabel(option);
+                                    bool exists   = false;
+                                    for(const auto &existing : depthProfiles_) {
+                                        if(SameDepthProfile(existing, option)) {
+                                            exists = true;
+                                            break;
+                                        }
+                                    }
+                                    if(!exists) {
+                                        depthProfiles_.push_back(option);
+                                    }
+                                }
                             }
                             info << "\n";
                         }
@@ -364,6 +437,9 @@ public:
                 info << "Sensor list error: " << SDKErrorString(e) << "\n";
             }
 
+            if(selectedDepthProfileIndex_ > depthProfiles_.size()) {
+                selectedDepthProfileIndex_ = 0;
+            }
             ok = true;
             status_ = "Device metadata refreshed.";
         }
@@ -379,42 +455,74 @@ public:
         return ok;
     }
 
-    void setEnabled(bool depthPreview, bool pointCloud) {
-        std::thread workerToJoin;
-        bool        startAfterJoin = false;
-        bool        shouldRun = depthPreview || pointCloud;
+    std::vector<DepthProfileOption> depthProfileOptions() const {
+        std::lock_guard<std::mutex> lock(controlMutex_);
+        return depthProfiles_;
+    }
+
+    size_t selectedDepthProfileIndex() const {
+        std::lock_guard<std::mutex> lock(controlMutex_);
+        return selectedDepthProfileIndex_;
+    }
+
+    std::string selectedDepthProfileLabel() const {
+        std::lock_guard<std::mutex> lock(controlMutex_);
+        if(selectedDepthProfileIndex_ == 0 || selectedDepthProfileIndex_ > depthProfiles_.size()) {
+            return "Auto";
+        }
+        return depthProfiles_[selectedDepthProfileIndex_ - 1].label;
+    }
+
+    void setDepthProfileIndex(size_t index) {
+        bool        running = false;
+        std::string label;
         {
             std::lock_guard<std::mutex> lock(controlMutex_);
+            if(index > depthProfiles_.size()) {
+                index = 0;
+            }
+            if(selectedDepthProfileIndex_ == index) {
+                return;
+            }
+            selectedDepthProfileIndex_ = index;
+            running = running_;
+            label   = index == 0 ? "Auto" : depthProfiles_[index - 1].label;
+        }
+
+        std::lock_guard<std::mutex> lock(infoMutex_);
+        status_ = running ? "Depth resolution queued: " + label + " (restart Depth to apply)" : "Depth resolution set: " + label;
+    }
+
+    void setEnabled(bool depthPreview, bool pointCloud) {
+        bool requestTransition = false;
+        bool shouldRun = depthPreview || pointCloud;
+        {
+            std::lock_guard<std::mutex> lock(controlMutex_);
+            if(shuttingDown_) {
+                return;
+            }
             wantDepthPreview_.store(depthPreview);
             wantPointCloud_.store(pointCloud);
 
-            if(!running_ && worker_.joinable()) {
-                workerToJoin = std::move(worker_);
-                startAfterJoin = shouldRun;
-            }
-            else if(shouldRun && !running_) {
-                stopRequested_.store(false);
-                running_ = true;
-                worker_  = std::thread(&OrbbecDepthEngine::captureLoop, this);
+            if(shouldRun && !running_) {
+                if(worker_.joinable()) {
+                    requestTransition = true;
+                }
+                else {
+                    startDepthWorkerLocked();
+                }
             }
             else if(!shouldRun && running_) {
                 stopRequested_.store(true);
-                running_ = false;
-                if(worker_.joinable()) {
-                    workerToJoin = std::move(worker_);
-                }
+                requestTransition = true;
+            }
+            else if(!shouldRun && worker_.joinable()) {
+                stopRequested_.store(true);
+                requestTransition = true;
             }
         }
-        if(workerToJoin.joinable()) {
-            workerToJoin.join();
-        }
-        if(startAfterJoin) {
-            std::lock_guard<std::mutex> lock(controlMutex_);
-            if((wantDepthPreview_.load() || wantPointCloud_.load()) && !running_) {
-                stopRequested_.store(false);
-                running_ = true;
-                worker_  = std::thread(&OrbbecDepthEngine::captureLoop, this);
-            }
+        if(requestTransition) {
+            requestTransitionWorker();
         }
     }
 
@@ -533,6 +641,86 @@ public:
     }
 
 private:
+    void startDepthWorkerLocked() {
+        stopRequested_.store(false);
+        running_ = true;
+        worker_  = std::thread(&OrbbecDepthEngine::captureLoop, this);
+    }
+
+    void requestTransitionWorker() {
+        std::thread finishedTransition;
+        {
+            std::lock_guard<std::mutex> lock(controlMutex_);
+            if(shuttingDown_ || transitionInProgress_) {
+                return;
+            }
+            transitionInProgress_ = true;
+            if(transitionWorker_.joinable()) {
+                finishedTransition = std::move(transitionWorker_);
+            }
+        }
+        if(finishedTransition.joinable()) {
+            finishedTransition.join();
+        }
+        {
+            std::lock_guard<std::mutex> lock(controlMutex_);
+            if(shuttingDown_) {
+                transitionInProgress_ = false;
+                return;
+            }
+            transitionWorker_ = std::thread(&OrbbecDepthEngine::transitionLoop, this);
+        }
+    }
+
+    void transitionLoop() {
+        std::thread workerToJoin;
+        {
+            std::lock_guard<std::mutex> lock(controlMutex_);
+            if(worker_.joinable()) {
+                workerToJoin = std::move(worker_);
+            }
+        }
+        if(workerToJoin.joinable()) {
+            workerToJoin.join();
+        }
+
+        {
+            std::lock_guard<std::mutex> lock(controlMutex_);
+            running_ = false;
+            transitionInProgress_ = false;
+            if(!shuttingDown_ && (wantDepthPreview_.load() || wantPointCloud_.load())) {
+                startDepthWorkerLocked();
+            }
+        }
+    }
+
+    void shutdown() {
+        std::thread transitionToJoin;
+        std::thread workerToJoin;
+        {
+            std::lock_guard<std::mutex> lock(controlMutex_);
+            shuttingDown_ = true;
+            wantDepthPreview_.store(false);
+            wantPointCloud_.store(false);
+            stopRequested_.store(true);
+            if(transitionWorker_.joinable()) {
+                transitionToJoin = std::move(transitionWorker_);
+            }
+        }
+        if(transitionToJoin.joinable()) {
+            transitionToJoin.join();
+        }
+        {
+            std::lock_guard<std::mutex> lock(controlMutex_);
+            if(worker_.joinable()) {
+                workerToJoin = std::move(worker_);
+            }
+        }
+        if(workerToJoin.joinable()) {
+            workerToJoin.join();
+        }
+    }
+
     OBCameraIntrinsic chooseDepthIntrinsic(int width, int height) const {
         for(const auto &param : calibrationParams_) {
             if(param.depthIntrinsic.width == width && param.depthIntrinsic.height == height) {
@@ -594,13 +782,29 @@ private:
                 throw std::runtime_error("No Orbbec device available");
             }
 
+            DepthProfileOption selectedProfile{};
+            bool               hasSelectedProfile = false;
+            {
+                std::lock_guard<std::mutex> lock(controlMutex_);
+                if(selectedDepthProfileIndex_ > 0 && selectedDepthProfileIndex_ <= depthProfiles_.size()) {
+                    selectedProfile     = depthProfiles_[selectedDepthProfileIndex_ - 1];
+                    hasSelectedProfile  = true;
+                }
+            }
+
             pipeline    = std::make_shared<ob::Pipeline>(device_);
             auto config = std::make_shared<ob::Config>();
-            config->enableVideoStream(OB_STREAM_DEPTH);
+            if(hasSelectedProfile) {
+                config->enableVideoStream(OB_STREAM_DEPTH, selectedProfile.width, selectedProfile.height, selectedProfile.fps,
+                                          selectedProfile.format);
+            }
+            else {
+                config->enableVideoStream(OB_STREAM_DEPTH);
+            }
             pipeline->start(config);
             {
                 std::lock_guard<std::mutex> lock(infoMutex_);
-                status_ = "Depth pipeline running.";
+                status_ = hasSelectedProfile ? "Depth pipeline running: " + selectedProfile.label : "Depth pipeline running: Auto";
             }
 
             while(!stopRequested_.load()) {
@@ -669,11 +873,16 @@ private:
     std::shared_ptr<ob::Context> context_;
     std::shared_ptr<ob::Device>  device_;
     std::vector<OBCameraParam>   calibrationParams_;
+    std::vector<DepthProfileOption> depthProfiles_;
+    size_t                       selectedDepthProfileIndex_ = 0;
 
     std::thread       worker_;
+    std::thread       transitionWorker_;
     std::atomic<bool> stopRequested_{false};
     std::atomic<bool> wantDepthPreview_{false};
     std::atomic<bool> wantPointCloud_{false};
+    bool              transitionInProgress_ = false;
+    bool              shuttingDown_ = false;
     bool              running_ = false;
 
     std::string infoText_;
@@ -696,6 +905,9 @@ private:
 - (void)start;
 - (void)stop;
 - (NSString *)status;
+- (NSArray<NSString *> *)resolutionLabels;
+- (NSString *)selectedResolutionLabel;
+- (void)setResolutionLabel:(NSString *)label;
 - (BOOL)copyBGRA:(std::vector<uint8_t> &)bgra width:(int &)width height:(int &)height version:(uint64_t &)version;
 - (NSString *)saveLatestToDirectory:(NSString *)directory;
 @end
@@ -707,6 +919,8 @@ private:
     std::vector<uint8_t> _bgra;
     int               _width;
     int               _height;
+    int               _requestedWidth;
+    int               _requestedHeight;
     uint64_t          _version;
     NSString         *_status;
 }
@@ -717,6 +931,8 @@ private:
         _queue   = dispatch_queue_create("orbbec.viewer.rgb", DISPATCH_QUEUE_SERIAL);
         _width   = 0;
         _height  = 0;
+        _requestedWidth  = 0;
+        _requestedHeight = 0;
         _version = 0;
         _status  = @"RGB stream stopped.";
     }
@@ -751,6 +967,89 @@ private:
     return best ?: fallback;
 }
 
+- (NSArray<NSString *> *)resolutionLabels {
+    AVCaptureDevice *device = [self preferredDevice];
+    if(!device) {
+        return @[ @"Auto" ];
+    }
+
+    NSMutableSet<NSString *> *seen = [NSMutableSet set];
+    NSMutableArray<NSString *> *labels = [NSMutableArray array];
+    for(AVCaptureDeviceFormat *format in device.formats) {
+        CMVideoDimensions dims = CMVideoFormatDescriptionGetDimensions(format.formatDescription);
+        if(dims.width <= 0 || dims.height <= 0) {
+            continue;
+        }
+        NSString *label = ResolutionLabel(dims.width, dims.height);
+        if(![seen containsObject:label]) {
+            [seen addObject:label];
+            [labels addObject:label];
+        }
+    }
+
+    NSArray<NSString *> *sorted = [labels sortedArrayUsingComparator:^NSComparisonResult(NSString *a, NSString *b) {
+      int aw = 0, ah = 0, bw = 0, bh = 0;
+      ParseResolutionLabel(a, &aw, &ah);
+      ParseResolutionLabel(b, &bw, &bh);
+      NSInteger areaA = aw * ah;
+      NSInteger areaB = bw * bh;
+      if(areaA != areaB) {
+          return areaA > areaB ? NSOrderedAscending : NSOrderedDescending;
+      }
+      return [a compare:b options:NSNumericSearch];
+    }];
+
+    NSMutableArray<NSString *> *result = [NSMutableArray arrayWithObject:@"Auto"];
+    [result addObjectsFromArray:sorted];
+    return result;
+}
+
+- (NSString *)selectedResolutionLabel {
+    if(_requestedWidth <= 0 || _requestedHeight <= 0) {
+        return @"Auto";
+    }
+    return ResolutionLabel(_requestedWidth, _requestedHeight);
+}
+
+- (AVCaptureDeviceFormat *)requestedFormatForDevice:(AVCaptureDevice *)device {
+    if(!device || _requestedWidth <= 0 || _requestedHeight <= 0) {
+        return nil;
+    }
+
+    AVCaptureDeviceFormat *bestFormat = nil;
+    double                 bestFPS = 0.0;
+    for(AVCaptureDeviceFormat *format in device.formats) {
+        CMVideoDimensions dims = CMVideoFormatDescriptionGetDimensions(format.formatDescription);
+        if(dims.width != _requestedWidth || dims.height != _requestedHeight) {
+            continue;
+        }
+        double maxFPS = 0.0;
+        for(AVFrameRateRange *range in format.videoSupportedFrameRateRanges) {
+            maxFPS = std::max(maxFPS, range.maxFrameRate);
+        }
+        if(!bestFormat || maxFPS > bestFPS) {
+            bestFormat = format;
+            bestFPS = maxFPS;
+        }
+    }
+    return bestFormat;
+}
+
+- (void)setResolutionLabel:(NSString *)label {
+    int requestedWidth = 0;
+    int requestedHeight = 0;
+    ParseResolutionLabel(label, &requestedWidth, &requestedHeight);
+    if(_requestedWidth == requestedWidth && _requestedHeight == requestedHeight) {
+        return;
+    }
+
+    BOOL wasRunning = _session && _session.isRunning;
+    _requestedWidth  = requestedWidth;
+    _requestedHeight = requestedHeight;
+    _status = wasRunning ? [NSString stringWithFormat:@"RGB resolution queued: %@ (restart RGB to apply)", [self selectedResolutionLabel]]
+                         : [NSString stringWithFormat:@"RGB resolution set: %@", [self selectedResolutionLabel]];
+}
+
 - (void)start {
     if(_session && _session.isRunning) {
         return;
@@ -783,7 +1082,24 @@ private:
         return;
     }
 
+    AVCaptureDeviceFormat *requestedFormat = [self requestedFormatForDevice:device];
+    if(_requestedWidth > 0 && !requestedFormat) {
+        _status = [NSString stringWithFormat:@"RGB resolution unavailable: %@", [self selectedResolutionLabel]];
+    }
+
     NSError *error = nil;
+    if(requestedFormat) {
+        if([device lockForConfiguration:&error]) {
+            device.activeFormat = requestedFormat;
+            [device unlockForConfiguration];
+            error = nil;
+        }
+        else {
+            _status = [NSString stringWithFormat:@"RGB format error: %@", error.localizedDescription];
+            error = nil;
+        }
+    }
+
     AVCaptureDeviceInput *input = [AVCaptureDeviceInput deviceInputWithDevice:device error:&error];
     if(!input) {
         _status = [NSString stringWithFormat:@"RGB input error: %@", error.localizedDescription];
@@ -791,7 +1107,9 @@ private:
     }
 
     AVCaptureSession *session = [[AVCaptureSession alloc] init];
-    session.sessionPreset = AVCaptureSessionPreset640x480;
+    if(!requestedFormat && [session canSetSessionPreset:AVCaptureSessionPreset640x480]) {
+        session.sessionPreset = AVCaptureSessionPreset640x480;
+    }
     if([session canAddInput:input]) {
         [session addInput:input];
     }
@@ -814,7 +1132,8 @@ private:
 
     _session = session;
     [_session startRunning];
-    _status = [NSString stringWithFormat:@"RGB running: %@", device.localizedName];
+    NSString *mode = requestedFormat ? [self selectedResolutionLabel] : @"Auto";
+    _status = [NSString stringWithFormat:@"RGB running: %@ (%@)", device.localizedName, mode];
 }
 
 - (void)stop {
@@ -1011,6 +1330,10 @@ private:
     NSButton      *_rgbToggle;
     NSButton      *_depthToggle;
     NSButton      *_cloudToggle;
+    NSTextField   *_depthResolutionLabel;
+    NSTextField   *_rgbResolutionLabel;
+    NSPopUpButton *_depthResolutionPopup;
+    NSPopUpButton *_rgbResolutionPopup;
     NSMutableArray<NSButton *> *_actionButtons;
     NSTimer       *_timer;
 
@@ -1033,7 +1356,7 @@ private:
                                             backing:NSBackingStoreBuffered
                                               defer:NO];
     _window.title = @"Orbbec Test Viewer";
-    _window.minSize = NSMakeSize(1040, 700);
+    _window.minSize = NSMakeSize(1180, 740);
     _root = [[FlippedView alloc] initWithFrame:NSMakeRect(0, 0, frame.size.width, frame.size.height)];
     _root.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
     _root.wantsLayer = YES;
@@ -1077,6 +1400,21 @@ private:
         button.font = [NSFont systemFontOfSize:13 weight:NSFontWeightMedium];
         [_root addSubview:button];
     }
+
+    _depthResolutionLabel = MakeLabel(@"Depth Res", [NSFont systemFontOfSize:12 weight:NSFontWeightMedium], ColorFromHex(0x334155));
+    _rgbResolutionLabel = MakeLabel(@"RGB Res", [NSFont systemFontOfSize:12 weight:NSFontWeightMedium], ColorFromHex(0x334155));
+    _depthResolutionPopup = [[NSPopUpButton alloc] initWithFrame:NSZeroRect pullsDown:NO];
+    _rgbResolutionPopup = [[NSPopUpButton alloc] initWithFrame:NSZeroRect pullsDown:NO];
+    for(NSPopUpButton *popup in @[ _depthResolutionPopup, _rgbResolutionPopup ]) {
+        popup.font = [NSFont systemFontOfSize:12 weight:NSFontWeightRegular];
+        [_root addSubview:popup];
+    }
+    _depthResolutionPopup.target = self;
+    _depthResolutionPopup.action = @selector(changeDepthResolution:);
+    _rgbResolutionPopup.target = self;
+    _rgbResolutionPopup.action = @selector(changeRGBResolution:);
+    [_root addSubview:_depthResolutionLabel];
+    [_root addSubview:_rgbResolutionLabel];
 
     NSArray<NSArray *> *buttons = @[
         @[ @"Reload Device", NSStringFromSelector(@selector(refreshInfo:)) ],
@@ -1125,6 +1463,7 @@ private:
     _rgbBox = [self addPanelWithTitle:@"RGB Video" content:_rgbImageView];
     _depthBox = [self addPanelWithTitle:@"Depth Video" content:_depthImageView];
     _cloudBox = [self addPanelWithTitle:@"Point Cloud" content:_cloudView];
+    [self populateResolutionMenus];
 }
 
 - (NSBox *)addPanelWithTitle:(NSString *)title content:(NSView *)content {
@@ -1148,7 +1487,7 @@ private:
     CGFloat h = _root.bounds.size.height;
     CGFloat margin = 16.0;
     CGFloat top = 14.0;
-    CGFloat toolbarH = 72.0;
+    CGFloat toolbarH = 112.0;
     CGFloat infoW = 390.0;
     CGFloat gap = 14.0;
 
@@ -1164,7 +1503,11 @@ private:
         button.frame = NSMakeRect(buttonX, top, bw, 28);
         buttonX += bw + 10.0;
     }
-    _statusLabel.frame = NSMakeRect(margin, 46, w - margin * 2, 20);
+    _depthResolutionLabel.frame = NSMakeRect(margin, 48, 68, 20);
+    _depthResolutionPopup.frame = NSMakeRect(86, 43, 190, 28);
+    _rgbResolutionLabel.frame = NSMakeRect(296, 48, 58, 20);
+    _rgbResolutionPopup.frame = NSMakeRect(356, 43, 156, 28);
+    _statusLabel.frame = NSMakeRect(margin, 78, w - margin * 2, 20);
 
     _infoScroll.frame = NSMakeRect(margin, toolbarH + margin, infoW, h - toolbarH - margin * 2);
     _infoTextView.frame = NSMakeRect(0, 0, infoW - 20, std::max(900.0, h - toolbarH - margin * 2));
@@ -1190,6 +1533,44 @@ private:
     [self layoutViews];
 }
 
+- (void)populateResolutionMenus {
+    [_depthResolutionPopup removeAllItems];
+    [_depthResolutionPopup addItemWithTitle:@"Auto"];
+    auto depthOptions = _depth->depthProfileOptions();
+    for(const auto &option : depthOptions) {
+        [_depthResolutionPopup addItemWithTitle:NSStringFromStd(option.label)];
+    }
+    size_t selectedDepth = _depth->selectedDepthProfileIndex();
+    if(selectedDepth > depthOptions.size()) {
+        selectedDepth = 0;
+    }
+    [_depthResolutionPopup selectItemAtIndex:static_cast<NSInteger>(selectedDepth)];
+
+    NSString *selectedRGB = [_rgb selectedResolutionLabel];
+    [_rgbResolutionPopup removeAllItems];
+    NSArray<NSString *> *rgbLabels = [_rgb resolutionLabels];
+    for(NSString *label in rgbLabels) {
+        [_rgbResolutionPopup addItemWithTitle:label];
+    }
+    NSInteger rgbIndex = [rgbLabels indexOfObject:selectedRGB];
+    [_rgbResolutionPopup selectItemAtIndex:rgbIndex == NSNotFound ? 0 : rgbIndex];
+}
+
+- (void)changeDepthResolution:(id)sender {
+    NSInteger index = _depthResolutionPopup.indexOfSelectedItem;
+    if(index < 0) {
+        return;
+    }
+    _depth->setDepthProfileIndex(static_cast<size_t>(index));
+    [self updateStatus:[NSString stringWithFormat:@"Depth resolution: %@", _depthResolutionPopup.titleOfSelectedItem]];
+}
+
+- (void)changeRGBResolution:(id)sender {
+    NSString *label = _rgbResolutionPopup.titleOfSelectedItem ?: @"Auto";
+    [_rgb setResolutionLabel:label];
+    [self updateStatus:[NSString stringWithFormat:@"RGB resolution: %@", label]];
+}
+
 - (void)toggleStreams:(id)sender {
     if(_rgbToggle.state == NSControlStateValueOn) {
         [_rgb start];
@@ -1206,6 +1587,7 @@ private:
 - (void)refreshInfo:(id)sender {
     bool ok = _depth->refreshDeviceInfo();
     _infoTextView.string = NSStringFromStd(_depth->infoText());
+    [self populateResolutionMenus];
     [self updateStatus:ok ? @"Device metadata refreshed." : NSStringFromStd(_depth->status())];
 }
 
