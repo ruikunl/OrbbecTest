@@ -15,8 +15,3 @@ __pycache__/
 /wheel_extract/
 /downloads/*
 !/downloads/.gitkeep
-
-# OrbbecSDK is a third-party binary SDK. Download and extract it locally;
-# do not vendor the SDK package into this repository.
-/sdk_v1_10_16/*
-!/sdk_v1_10_16/.gitkeep

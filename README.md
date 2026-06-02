@@ -30,7 +30,7 @@ Connection: USB2.0
 
 - macOS
 - Xcode Command Line Tools
-- OrbbecSDK C/C++ v1.10.16 for macOS arm64/x86
+- OrbbecSDK C/C++ v1.10.16 for macOS arm64/x86，已随本仓库提交在 `sdk_v1_10_16/`
 - Python 3，仅用于把文本参数报告整理成 JSON 摘要
 
 不需要：
@@ -47,9 +47,9 @@ Connection: USB2.0
 xcode-select --install
 ```
 
-## 安装 OrbbecSDK
+## OrbbecSDK
 
-从奥比中光官方渠道下载 macOS arm64/x86 的 C/C++ SDK v1.10.16，并解压到下面这个结构：
+仓库已经包含解压后的 OrbbecSDK C/C++ v1.10.16 for macOS arm64/x86，结构如下：
 
 ```text
 OrbbecTest/
@@ -60,7 +60,12 @@ OrbbecTest/
         lib/
 ```
 
-本仓库不提交 SDK 压缩包、dylib、构建产物和本地输出文件；这些都由本地安装或构建生成。
+官方下载地址：
+
+- Release 页面：<https://github.com/orbbec/OrbbecSDK/releases/tag/v1.10.16>
+- macOS C/C++ SDK 直链：<https://github.com/orbbec/OrbbecSDK/releases/download/v1.10.16/OrbbecSDK_C_C++_v1.10.16_20241021_c0329e3_macos_arm64_x86.zip>
+
+构建产物、日志、本地输出文件仍然不会提交；这些由本地运行生成。
 
 ## 读取参数
 
@@ -142,8 +147,8 @@ viewer/
 
 ## downloads 清理结论
 
-之前 `downloads/` 里的三个文件都不需要提交：
+之前 `downloads/` 里的三个文件都不需要提交。SDK 采用解压后的目录随仓库提交，压缩包本身仍然不放进 `downloads/`：
 
 - `pyorbbecsdk2-2.1.1-...whl`：不需要。这个 Python SDK 没有识别当前旧 OpenNI 设备。
 - `cpython-3.13.13-...tar.gz`：不需要。最终方案不依赖单独打包的 Python runtime。
-- `OrbbecSDK_C_C++_v1.10.16_...zip`：压缩包本身不需要。项目只需要你本机解压后的 OrbbecSDK 目录，且该第三方 SDK 不纳入 git。
+- `OrbbecSDK_C_C++_v1.10.16_...zip`：压缩包本身不需要。仓库已经提交了解压后的 SDK 目录；需要重新下载时用上面的官方地址。
